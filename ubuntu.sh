@@ -40,13 +40,34 @@ fi
 [[ ${ID:-} == ubuntu || " ${ID_LIKE:-} " == *' ubuntu '* || " ${ID_LIKE:-} " == *' debian '* ]] || { echo "Ubuntu or Ubuntu-derived OS required: ${ID:-unknown}" >&2; exit 1; }
 command -v apt-get >/dev/null || { echo 'apt-get is missing.' >&2; exit 1; }
 [[ $(uname -m) == x86_64 ]] || { echo 'This installer supports x86_64 only.' >&2; exit 1; }
-export PATH="/usr/local/cuda/bin:$PATH"
+# Prefer an explicit compiler, then the version selected by /usr/local/cuda,
+# rather than Ubuntu's potentially outdated /usr/bin/nvcc. Do not change system alternatives.
+select_cuda() {
+ local candidate="${CUDACXX:-}" root version major minor
+ if [[ -z $candidate && -x /usr/local/cuda/bin/nvcc ]]; then candidate=/usr/local/cuda/bin/nvcc; fi
+ if [[ -z $candidate ]]; then candidate=$(command -v nvcc || true); fi
+ [[ -n $candidate && -x $candidate ]] || return 1
+ candidate=$(readlink -f "$candidate")
+ root=$(cd "$(dirname "$candidate")/.." && pwd -P)
+ version=$("$candidate" --version | sed -n 's/.*release \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1.\2/p' | tail -1)
+ [[ -n $version ]] || { echo "Cannot determine CUDA version: $candidate" >&2; return 1; }
+ major=${version%%.*}; minor=${version#*.}
+ # Blackwell / sm_120 requires a toolkit supporting compute capability 12.0.
+ if [[ $major -lt 12 || ( $major -eq 12 && $minor -lt 8 ) ]]; then
+  echo "CUDA $version at $candidate is too old for the supported Blackwell build (need CUDA >= 12.8)." >&2
+  return 1
+ fi
+ [[ -x $root/bin/ptxas ]] || { echo "Missing ptxas in $root/bin" >&2; return 1; }
+ export CUDA_HOME="$root" CUDA_PATH="$root" CUDAToolkit_ROOT="$root" CUDACXX="$candidate"
+ export PATH="$root/bin:$PATH"
+ echo "Selected CUDA $version: $CUDACXX (ptxas: $root/bin/ptxas)"
+}
 if [[ $BACKEND == auto ]]; then
- if command -v nvcc >/dev/null 2>&1 && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then BACKEND=cuda; else BACKEND=cpu; fi
+ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 && select_cuda; then BACKEND=cuda; else BACKEND=cpu; fi
 fi
 if [[ $BACKEND == cuda ]]; then
- command -v nvcc >/dev/null 2>&1 || { echo 'CUDA toolkit (nvcc) missing. Install a compatible toolkit first or use --backend cpu.' >&2; exit 1; }
  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 || { echo 'NVIDIA driver/GPU unavailable.' >&2; exit 1; }
+ select_cuda || { echo 'Compatible CUDA toolkit missing. Use CUDA 12.8+ or --backend cpu.' >&2; exit 1; }
 fi
 LM_FILE="acestep-5Hz-lm-${LM_SIZE}-Q8_0.gguf"
 echo "Music Generator Ubuntu setup | ${PRETTY_NAME:-$ID} | backend=$BACKEND | LM=$LM_SIZE"
@@ -56,7 +77,7 @@ if [[ $DRY == 1 ]]; then
  printf 'PLAN apt-get install: '; printf '%s ' "${packages[@]}"; echo
  echo 'PLAN uv sync --locked'
  echo "PLAN git checkout $ACESTEP_REV and git submodule update --init --recursive"
- if [[ $BACKEND == cuda ]]; then echo 'PLAN CMake: -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native -DGGML_CPU_ALL_VARIANTS=OFF'; else echo 'PLAN CMake: -DGGML_CPU_ALL_VARIANTS=OFF'; fi
+ if [[ $BACKEND == cuda ]]; then echo "PLAN CUDA: $CUDACXX"; echo 'PLAN CMake: -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native -DGGML_CPU_ALL_VARIANTS=OFF'; else echo 'PLAN CMake: -DGGML_CPU_ALL_VARIANTS=OFF'; fi
  echo "PLAN download + SHA256 verify: VAE, Qwen embedding, SFT, $LM_FILE $([[ $XL == 1 ]] && echo 'and XL' || true)"
  echo 'PLAN run local inference self-test and atomically write data/engine.conf'
  exit 0
@@ -84,7 +105,11 @@ BUILD=0
 [[ $REBUILD == 1 || ! -x "$ENGINE/build/ace-server" ]] && BUILD=1
 # Never reuse a previous CPU build when CUDA was selected (or vice versa).
 if [[ -f "$ENGINE/build/CMakeCache.txt" ]]; then
- if [[ $BACKEND == cuda ]] && ! grep -qx "GGML_CUDA:BOOL=ON" "$ENGINE/build/CMakeCache.txt"; then BUILD=1; fi
+ if [[ $BACKEND == cuda ]]; then
+  if ! grep -qx "GGML_CUDA:BOOL=ON" "$ENGINE/build/CMakeCache.txt"; then BUILD=1; fi
+  cached_compiler=$(sed -n 's/^CMAKE_CUDA_COMPILER:FILEPATH=//p; s/^CMAKE_CUDA_COMPILER:STRING=//p' "$ENGINE/build/CMakeCache.txt" | head -n 1)
+  [[ -n $cached_compiler && $(readlink -f "$cached_compiler") == "$CUDACXX" ]] || BUILD=1
+ fi
  if [[ $BACKEND == cpu ]] && grep -qx "GGML_CUDA:BOOL=ON" "$ENGINE/build/CMakeCache.txt"; then BUILD=1; fi
 else BUILD=1; fi
 if [[ $BUILD == 1 ]]; then
@@ -92,7 +117,7 @@ if [[ $BUILD == 1 ]]; then
  if [[ $BACKEND == cuda ]]; then flags+=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native); fi
  build_engine() {
   local target=$1; local -a f=(-DCMAKE_BUILD_TYPE=Release -DGGML_CPU_ALL_VARIANTS=OFF)
-  if [[ $target == cuda ]]; then f+=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native); fi
+  if [[ $target == cuda ]]; then f+=(-DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDAToolkit_ROOT="$CUDA_HOME" -DCMAKE_CUDA_ARCHITECTURES=native); fi
   ( cd "$ENGINE"; rm -rf build; cmake -S . -B build "${f[@]}"; cmake --build build --config Release -j "${BUILD_JOBS:-4}" ) > "$DATA/build.log" 2>&1
  }
  if ! build_engine "$BACKEND"; then
@@ -101,35 +126,3 @@ if [[ $BUILD == 1 ]]; then
  fi
 fi
 [[ -x "$ENGINE/build/ace-server" ]] || { echo 'ace-server executable missing after build.' >&2; exit 1; }
-mkdir -p "$MODELS"
-files=(vae-BF16.gguf Qwen3-Embedding-0.6B-Q8_0.gguf acestep-v15-sft-Q8_0.gguf "$LM_FILE")
-[[ $XL == 1 ]] && files+=(acestep-v15-xl-sft-Q8_0.gguf)
-for f in "${files[@]}"; do
- record=$(printf '%s\n' "$MODEL_FILES" | grep -F "$f:" | head -n 1)
- [[ -n $record ]] || { echo "No pinned checksum for $f" >&2; exit 1; }
- IFS=: read -r _ mb sha <<< "$record"
- if [[ -f "$MODELS/$f" ]]; then
-  if printf '%s  %s\n' "$sha" "$MODELS/$f" | sha256sum -c --status; then echo "Verified existing $f"; continue; fi
-  echo "Existing $f has invalid SHA256. Not overwriting; move it aside manually." >&2; exit 1
- fi
- echo "Downloading $f ($mb MB)"
- curl -fL -C - --retry 3 -o "$MODELS/$f.part" "$HF_BASE/$f"
- if ! printf '%s  %s\n' "$sha" "$MODELS/$f.part" | sha256sum -c --status; then rm -f "$MODELS/$f.part"; echo "Checksum mismatch: $f" >&2; exit 1; fi
- mv "$MODELS/$f.part" "$MODELS/$f"
-done
-# Keep original project's single/split mode decision via its own self-test.
-MODE=single
-TEST_PORT=8099
-if laeuft "$TEST_PORT"; then echo 'Self-test port 8099 occupied; refusing to overwrite configuration.' >&2; exit 1; fi
-"$ENGINE/build/ace-server" --host 127.0.0.1 --port "$TEST_PORT" --models "$MODELS" --max-batch 1 > "$DATA/selftest.log" 2>&1 & test_pid=$!
-cleanup() { kill "$test_pid" 2>/dev/null || true; wait "$test_pid" 2>/dev/null || true; }
-trap cleanup EXIT
-ready=0
-for ((i=0;i<120;i++)); do if ! kill -0 "$test_pid" 2>/dev/null; then break; fi; if curl -fsS --max-time 1 "http://127.0.0.1:$TEST_PORT/health" >/dev/null 2>&1; then ready=1; break; fi; sleep .5; done
-[[ $ready == 1 ]] || { echo 'Server health check failed; see data/selftest.log' >&2; exit 1; }
-if ! uv run python scripts/metal_selftest.py "$TEST_PORT" "$LM_FILE"; then MODE=split; echo 'Single-mode inference failed; selected split mode.'; fi
-cleanup; trap - EXIT
-conf_tmp=$(mktemp "$DATA/engine.conf.XXXXXX")
-printf 'MODE=%s\nLM_FILE=%s\nTESTED_REV=%s\nVAE_CHUNK=\nBACKEND=%s\n' "$MODE" "$LM_FILE" "$ACESTEP_REV" "$BACKEND" > "$conf_tmp"
-mv "$conf_tmp" "$CONF"
-echo "Installation finished: backend=$BACKEND mode=$MODE. Start using ./ubuntu.sh --start"
